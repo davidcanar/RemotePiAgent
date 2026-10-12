@@ -16,6 +16,10 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 var builder = WebApplication.CreateBuilder(args);
 var cfg = builder.Configuration;
 
+// Run correctly under the Windows Service Control Manager (no-op in console).
+// Without this, SCM kills the process after 30 s (event 7009/7000, error 1053).
+builder.Services.AddWindowsService(o => o.ServiceName = "RemotePiAgent");
+
 // ------------------------------------------------------- CLI helper modes ---
 // (run with --hash-password / --gen-totp / --gen-tokenkey to print a value and exit)
 if (args.Length >= 2 && args[0] == "--hash-password")
@@ -98,9 +102,11 @@ builder.WebHost.ConfigureKestrel(o =>
         }
         if (cert is null)
         {
-            // Temporary self-signed fallback - replace with a real cert via CertThumbprint.
-            cert = Security.CreateSelfSignedCert(listenPort);
-            Log.Audit($"WARNING: using temporary self-signed certificate on port {listenPort}");
+            // Self-signed fallback - persisted to disk so the fingerprint stays
+            // stable across restarts (browsers accept it once and keep trusting it).
+            // Replace with a real cert via CertThumbprint when available.
+            cert = Security.GetOrCreatePersistentSelfSignedCert(listenPort);
+            Log.Audit($"WARNING: using persistent self-signed certificate on port {listenPort}");
         }
         lo.UseHttps(cert);
     });
@@ -388,10 +394,39 @@ static class Security
     {
         var rsa = RSA.Create(2048);
         var req = new CertificateRequest("CN=RemotePiAgent", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddYears(1));
+        // SANs so modern browsers validate the shape of the cert properly.
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddDnsName(Environment.MachineName);
+        req.CertificateExtensions.Add(san.Build());
+        var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddYears(5));
+        return cert;
+    }
+
+    // Keeps one stable self-signed cert on disk: same fingerprint across restarts,
+    // so browser certificate exceptions keep working after service restarts/updates.
+    public static X509Certificate2 GetOrCreatePersistentSelfSignedCert(int port)
+    {
+        var pfxPath = Path.Combine(AppContext.BaseDirectory, "tls-selfsigned.pfx");
+        if (File.Exists(pfxPath))
+        {
+            try
+            {
+                return X509CertificateLoader.LoadPkcs12(File.ReadAllBytes(pfxPath), null);
+            }
+            catch (Exception ex)
+            {
+                Log.Audit($"WARNING: could not load {pfxPath} ({ex.GetType().Name}); regenerating");
+            }
+        }
+        var raw = CreateSelfSignedCert(port);            // exportable ephemeral key
+        byte[] pfx = raw.Export(X509ContentType.Pfx);    // export BEFORE round-tripping
         // Windows Schannel requires a persistent private key property; ephemeral certs
         // fail the TLS handshake (Event 36869). Round-tripping through PFX fixes that.
-        return X509CertificateLoader.LoadPkcs12(cert.Export(X509ContentType.Pfx), null);
+        var cert = X509CertificateLoader.LoadPkcs12(pfx, null);
+        File.WriteAllBytes(pfxPath, pfx);
+        Log.Audit($"INFO: generated new persistent self-signed certificate at {pfxPath}");
+        return cert;
     }
 
     public const string ClientPageHtml = """
@@ -422,23 +457,24 @@ static class Security
  <pre id="out">—</pre>
 </div>
 <script>
+const $ = id => document.getElementById(id);
 let token = '';
 async function api(path, body) {
   const r = await fetch(path, { method:'POST', headers:{ 'Content-Type':'application/json', ...(token?{'Authorization':'Bearer '+token}:{}) }, body: JSON.stringify(body) });
   return { status: r.status, data: await r.json().catch(() => ({})) };
 }
 async function login() {
-  const r = await api('/api/auth/login', { username: user.value, password: pass.value, totp: totp.value });
-  if (r.data.token) { token = r.data.token; auth.style.display='none'; agent.style.display='block'; out.textContent='logged in'; }
-  else out.textContent = 'Login failed: ' + (r.data.error || r.status);
+  const r = await api('/api/auth/login', { username: $('user').value, password: $('pass').value, totp: $('totp').value });
+  if (r.data.token) { token = r.data.token; $('auth').style.display='none'; $('agent').style.display='block'; $('out').textContent='logged in'; }
+  else $('out').textContent = 'Login failed: ' + (r.data.error || r.status);
 }
 async function run() {
-  out.textContent = 'working...';
-  const r = await api('/api/agent/run', { prompt: prompt.value });
+  $('out').textContent = 'working...';
+  const r = await api('/api/agent/run', { prompt: $('prompt').value });
   if (r.status === 401) { logout(); return; }
-  out.textContent = `exit: ${r.data.exitCode ?? '-'}\n\n--- stdout ---\n${r.data.stdout || ''}\n--- stderr ---\n${r.data.stderr || ''}\n${r.data.error ? 'error: '+r.data.error : ''}`;
+  $('out').textContent = `exit: ${r.data.exitCode ?? '-'}\n\n--- stdout ---\n${r.data.stdout || ''}\n--- stderr ---\n${r.data.stderr || ''}\n${r.data.error ? 'error: '+r.data.error : ''}`;
 }
-function logout() { token=''; agent.style.display='none'; auth.style.display='block'; }
+function logout() { token=''; $('agent').style.display='none'; $('auth').style.display='block'; }
 </script>
 </body>
 </html>
